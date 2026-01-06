@@ -4,3 +4,4 @@ numpy
 pyshp
 pandas
 Pillow
+scikit-learn
