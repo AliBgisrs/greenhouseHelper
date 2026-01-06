@@ -1,110 +1,114 @@
 import streamlit as st
 import cv2
 import numpy as np
-import shapefile
 import pandas as pd
-import io
-import zipfile
+from sklearn.cluster import DBSCAN
 
-def get_shapefile_zip(contours, ppm):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w') as zf:
-        shp_io, shx_io, dbf_io = io.BytesIO(), io.BytesIO(), io.BytesIO()
-        with shapefile.Writer(shp=shp_io, shx=shx_io, dbf=dbf_io) as w:
-            w.field('Plant_ID', 'N')
-            w.field('Area_cm2', 'F', decimal=3)
-            for i, cnt in enumerate(contours):
-                real_area = cv2.contourArea(cnt) / (ppm**2)
-                # Convert contour to list of points
-                w.poly([cnt.reshape(-1, 2).tolist()])
-                w.record(i + 1, real_area)
-        zf.writestr("canopy.shp", shp_io.getvalue())
-        zf.writestr("canopy.shx", shx_io.getvalue())
-        zf.writestr("canopy.dbf", dbf_io.getvalue())
-    return buf.getvalue()
+# --- Developed By Ali Bazrafkan ---
 
-# App Configuration
-st.set_page_config(layout="wide", page_title="Greenhouse Canopy Analyzer")
+def analyze_greenhouse(image, ppm, eps_scale, min_samples):
+    # 1. Image Pre-processing
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # Refined green range for greenhouse lighting
+    mask = cv2.inRange(hsv, np.array([30, 35, 35]), np.array([95, 255, 255]))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+    
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    points = []
+    features = []
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 100:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx, cy = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
+                x, y, w, h = cv2.boundingRect(cnt)
+                points.append({'contour': cnt, 'area': area, 'max_dim': max(w, h)})
+                features.append([cx, cy])
 
-# --- SIDEBAR ---
+    if not features:
+        return mask, image, []
+
+    # 2. Advanced DBSCAN Clustering
+    X = np.array(features)
+    # We use the average leaf size to define the search radius
+    avg_leaf_size = np.median([p['max_dim'] for p in points])
+    eps_value = avg_leaf_size * eps_scale
+    
+    clustering = DBSCAN(eps=eps_value, min_samples=int(min_samples)).fit(X)
+    labels = clustering.labels_
+
+    overlay = image.copy()
+    pot_results = []
+    
+    # 3. Process Clusters and Sort Geographically
+    unique_labels = set(labels)
+    cluster_data = []
+
+    for label in unique_labels:
+        if label == -1: continue 
+        
+        indices = [i for i, l in enumerate(labels) if l == label]
+        cluster_contours = [points[i]['contour'] for i in indices]
+        all_pts = np.concatenate(cluster_contours)
+        
+        total_px_area = sum([points[i]['area'] for i in indices])
+        hull = cv2.convexHull(all_pts)
+        x, y, w, h = cv2.boundingRect(hull)
+        
+        # Store for sorting
+        cluster_data.append({
+            'hull': hull,
+            'area_px': total_px_area,
+            'center': (x + w//2, y + h//2),
+            'bbox': (x, y, w, h)
+        })
+
+    # Sort Pots: First by Y (Row) then by X (Column)
+    cluster_data = sorted(cluster_data, key=lambda p: (p['center'][1] // 50, p['center'][0]))
+
+    for i, pot in enumerate(cluster_data):
+        real_area = pot['area_px'] / (ppm**2)
+        cv2.drawContours(overlay, [pot['hull']], -1, (0, 255, 0), 2)
+        
+        x, y, w, h = pot['bbox']
+        cv2.putText(overlay, f"ID:{i+1}", (x, y-10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        pot_results.append({"Pot ID": i+1, "Canopy Area (cm2)": round(real_area, 3)})
+
+    return mask, overlay, pot_results
+
+st.set_page_config(layout="wide", page_title="Ali Bazrafkan - Canopy Pro")
+st.sidebar.title("App Settings")
+st.sidebar.markdown("### **Developed By Ali Bazrafkan**")
+
 with st.sidebar:
-    st.title("Settings")
+    ppm = st.slider("Scale (Pixels/CM)", 10, 200, 85)
+    eps_scale = st.slider("Neighborhood Sensitivity", 0.5, 3.0, 1.2, 
+                          help="Lower this if two separate plants are getting the same ID.")
+    min_samples = st.number_input("Min Fragments per Pot", value=1)
     st.write("---")
-    ppm = st.slider("Calibration (Pixels Per CM)", 10, 250, 85)
-    min_size = st.number_input("Min Plant Size (Pixels)", value=500)
-    st.write("---")
-    # Your Branding
-    st.markdown("### **Developed By Ali Bazrafkan**")
-    st.info("Upload an image to start the automated canopy detection.")
+    st.warning("If plants touch, lower 'Neighborhood Sensitivity' to split them.")
 
-# --- MAIN UI ---
-st.title("🌿 Greenhouse Canopy: 3-Panel Analysis")
-
-uploaded_file = st.file_uploader("Upload Greenhouse RGB Image", type=["jpg", "png", "jpeg"])
+uploaded_file = st.file_uploader("Upload Greenhouse Image", type=["jpg", "png", "jpeg"])
 
 if uploaded_file:
-    # 1. Processing
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, 1)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # Generate Mask (Black & White)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array([35, 40, 40]), np.array([90, 255, 255]))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
+    mask, overlay, results = analyze_greenhouse(img_rgb, ppm, eps_scale, min_samples)
     
-    # Generate Overlay & Contours
-    overlay_img = img_rgb.copy()
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    valid_contours = []
-    stats = []
-    
-    for i, cnt in enumerate(contours):
-        px_area = cv2.contourArea(cnt)
-        if px_area > min_size:
-            valid_contours.append(cnt)
-            real_area = px_area / (ppm**2)
-            
-            # Draw on Overlay
-            cv2.drawContours(overlay_img, [cnt], -1, (0, 255, 255), 3) # Yellow polygons
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cx, cy = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
-                cv2.putText(overlay_img, str(i+1), (cx, cy), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 3)
-            
-            stats.append({"Plant ID": i+1, "Area (cm2)": round(real_area, 2)})
-
-    # --- THREE PANEL DISPLAY ---
     col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.subheader("1. Original Image")
-        st.image(img_rgb, use_container_width=True)
-        
-    with col2:
-        st.subheader("2. Detection Mask")
-        st.image(mask, use_container_width=True)
-        
-    with col3:
-        st.subheader("3. Result Overlay")
-        st.image(overlay_img, use_container_width=True)
+    with col1: st.image(img_rgb, caption="1. Original", use_container_width=True)
+    with col2: st.image(mask, caption="2. Binary Mask", use_container_width=True)
+    with col3: st.image(overlay, caption="3. Pot-by-Pot Analysis", use_container_width=True)
 
-    # --- RESULTS TABLE & EXPORT ---
-    st.divider()
-    df_col, dl_col = st.columns([2, 1])
-    
-    with df_col:
-        st.subheader("Individual Measurements")
-        st.dataframe(pd.DataFrame(stats), use_container_width=True, height=300)
-    
-    with dl_col:
-        st.subheader("Export Data")
-        zip_data = get_shapefile_zip(valid_contours, ppm)
-        st.download_button("📂 Download Shapefile (ZIP)", zip_data, "canopy_data.zip")
-        st.download_button("📊 Download CSV Report", pd.DataFrame(stats).to_csv(index=False), "canopy_stats.csv")
-
-else:
-
-    st.warning("Please upload an image to view results.")
+    if results:
+        df = pd.DataFrame(results)
+        st.subheader("Automated Canopy Inventory")
+        st.dataframe(df, use_container_width=True)
+        st.download_button("Export as CSV", df.to_csv(index=False), "greenhouse_data.csv")
