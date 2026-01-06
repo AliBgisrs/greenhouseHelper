@@ -106,4 +106,5 @@ if uploaded_file:
         st.download_button("📊 Download CSV Report", pd.DataFrame(stats).to_csv(index=False), "canopy_stats.csv")
 
 else:
+
     st.warning("Please upload an image to view results.")
